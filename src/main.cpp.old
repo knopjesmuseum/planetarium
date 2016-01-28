@@ -1,0 +1,388 @@
+/* DEPENDENCIES
+ * sudo apt-get install freeglut3-dev libglew-dev libfreeimage-dev
+ * 
+ * BUILD
+ * g++ main.cpp shader.cpp vec3.cpp -o water -lfreeimage -lglut -lGLU -lGLEW -lX11 -lXi -lXft -lXinerama -O3 -Wall
+ */
+
+#include <cmath>
+#include <iostream>
+#include <GL/glew.h>
+#include <GL/freeglut.h>
+#include <FreeImage.h>
+
+#include "vec3.h"
+#include "shader.h"
+#include "serial.h"
+
+#define shadeIntensity 0.25 // value between 0.0 (no shadow) and 1.0 (heavy shadow)
+#define lightDirection Vec3(1.0, 1.0, 10.0) // light direction compared with slopes in shadow calculation
+#define TWO_PI 6.2831853
+
+using namespace std;
+
+Serial serial;
+
+Shader levelshader;
+
+GLuint texData;
+GLUquadric *quad;
+
+bool shade;
+bool sphere;
+bool leftButton = false, middleButton = false, rightButton = false;
+int downX, downY;
+
+float* data;
+unsigned int xres, yres;
+int zmin, zmax;
+int level;
+
+float zoom;
+float xoff, yoff;
+float phi = 90.0;
+float theta = 45.0;
+
+int heights[16]  = {-8000,-5000,-3000,-2000,-1000,-150 ,-20  ,-5   ,0   ,0   ,10  ,500 ,2000,3000,5000,8000};
+float reds[16]   = { 0.06, 0.03, 0.00, 0.00, 0.00, 0.20, 0.30, 0.96,1.00,0.00,0.05,0.76,0.64,0.52,0.44,0.84};
+float greens[16] = { 0.00, 0.00, 0.00, 0.26, 0.38, 0.59, 0.76, 0.98,0.66,0.36,0.47,0.72,0.28,0.11,0.41,0.84};
+float blues[16]  = { 0.53, 0.59, 0.68, 0.73, 0.67, 0.82, 0.79, 0.60,0.49,0.25,0.19,0.41,0.22,0.30,0.41,0.84};
+
+void doZoom(int steps) {
+	float factor = pow(1.01, (float)steps);
+	zoom*= factor;
+	xoff*= factor;
+	yoff*= factor;
+}
+
+void loadData(string filename) {
+	// load elevation data from PNG file in (compressed) unsigned short format
+	cout << "loading " << filename << "..." << endl;
+	FREE_IMAGE_FORMAT format = FreeImage_GetFileType(filename.c_str(), 0);
+	FIBITMAP* image = FreeImage_Load(format, filename.c_str());
+	xres = FreeImage_GetWidth(image);
+	yres = FreeImage_GetHeight(image);
+	unsigned short* raw = (unsigned short*)FreeImage_GetBits(image);
+	
+	cout << "extracting elevation data and calculating shadows..." << endl;
+	data = (float*)malloc(2*xres*yres*sizeof(float));
+	int elevation;
+	int dx, dy, dh;
+	Vec3 u, v;
+	float s;
+	for (unsigned int y=0; y<yres; y++) for (unsigned int x=0; x<xres; x++) {
+		// store elevation as floating point number between 0.0 and 1.0
+		elevation = raw[y*xres + x];
+		data[2*(y*xres + x) + 0] = elevation/65536.0;
+		zmin = min(zmin, elevation - 32768);
+		zmax = max(zmax, elevation - 32768);
+		
+		// calculate longitudal slope
+		dx = 40000.0*cos(1.57*(y-yres/2)/yres)*2.0/xres;
+		dh = raw[y*xres + (x==xres-1 ? 0 : x+1)] - raw[y*xres + (x==0 ? xres-1 : x-1)];
+		u = Vec3(dx, 0.0, dh);
+		
+		// calculate latitudal slope
+		dy = 0.5*40000.0*2.0/yres;
+		if (y==0) dh = raw[(y+1)*xres + x] - raw[y*xres + (x+xres/2)%xres];
+		else if (y==yres-1) dh = raw[y*xres + (x+xres/2)%xres] - raw[(y-1)*xres + x];
+		else dh = raw[(y+1)*xres + x] - raw[(y-1)*xres + x];
+		v = Vec3(0.0, dy, dh);
+		
+		// calculate shadow factor depening on angle between slope normal and light direction
+		s = 1.0 - shadeIntensity*fabs(angle(cross(u, v), lightDirection)/1.57);
+		data[2*(y*xres + x) + 1] = s;
+	}
+	cout << "image size " << xres << " x " << yres << endl;
+	cout << "data between " << zmin << " and " << zmax << endl;
+	
+	// register elevation and shadow data as OpenGL texture
+	cout << "creating GL elevation texture from data..." << endl;
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glGenTextures(1, &texData);
+	glBindTexture(GL_TEXTURE_2D, texData);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, xres, yres, 0, GL_RG, GL_FLOAT, data);
+}
+
+void init(void) {    
+	xoff = 0.0;
+	yoff = 0.0;
+	level = 0;
+	zoom = 1.0;
+	sphere = false;
+	shade = 0;
+	
+	// setup OpenGL
+	glClearColor (0.0, 0.0, 0.0, 0.0);
+	glShadeModel(GL_FLAT);
+	glEnable(GL_DEPTH_TEST);
+	
+	// setup shader
+	glewInit();
+	levelshader.init("src/colormap.vert", "src/colormap.frag");
+	
+	// load elevation data
+	loadData("data/terra8M.png");
+//	loadData("data/terra32M.png");
+}
+
+void cbDisplay(void) {
+	// make variables available to the shader
+	levelshader.bind();
+	glUniform1iv(glGetUniformLocation(levelshader.id(), "heights"), 16, heights);
+	glUniform1fv(glGetUniformLocation(levelshader.id(), "reds"), 16, reds);
+	glUniform1fv(glGetUniformLocation(levelshader.id(), "greens"), 16, greens);
+	glUniform1fv(glGetUniformLocation(levelshader.id(), "blues"), 16, blues);
+
+	glUniform1i(glGetUniformLocation(levelshader.id(), "elevationMap"), 0);
+	glUniform1i(glGetUniformLocation(levelshader.id(), "level"), level);
+	glUniform1i(glGetUniformLocation(levelshader.id(), "zmin"), zmin);
+	glUniform1i(glGetUniformLocation(levelshader.id(), "zmax"), zmax);
+	glUniform1i(glGetUniformLocation(levelshader.id(), "shade"), shade);
+	
+	// setup scene
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	
+	// enable texture
+	glEnable(GL_TEXTURE_2D);
+	glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_DECAL);
+	glBindTexture(GL_TEXTURE_2D, texData);
+	
+	// draw map or sphere
+	glPushMatrix();
+		glTranslatef(0.0, 0.0, -2.0*zoom);
+		if (sphere) {
+			quad = gluNewQuadric();
+			gluQuadricTexture(quad,1);
+			glRotatef(-theta, 1.0, 0.0, 0.0);
+			glRotatef(phi, 0.0, 0.0, 1.0);
+			gluSphere(quad, zoom, 96, 48);
+		}
+		else {
+			glTranslatef(xoff, yoff, 0.0);
+			float ratio = (float)xres/yres;
+			glBegin(GL_QUADS);
+				glTexCoord2f(0.0, 0.0); glVertex3f(-zoom*ratio, -zoom, 0.0);
+				glTexCoord2f(0.0, 1.0); glVertex3f(-zoom*ratio, zoom, 0.0);
+				glTexCoord2f(1.0, 1.0); glVertex3f(zoom*ratio, zoom, 0.0);
+				glTexCoord2f(1.0, 0.0); glVertex3f(zoom*ratio, -zoom, 0.0);
+			glEnd();
+		}
+	glPopMatrix();
+	
+	// show image
+	glDisable(GL_TEXTURE_2D);
+	levelshader.unbind();
+	glFlush();
+}
+
+void cbReshape(int w, int h) {
+	// setup projection depending on viewport dimensions
+	glViewport(0, 0, (GLsizei) w, (GLsizei) h);
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glOrtho(-1.0*w/h, 1.0*w/h, -1, 1, 0.1, 100.0);
+}
+
+void cbKeys (unsigned char key, int x, int y) {
+	// handle key events
+	switch (key) {
+		case '=': level = min(level+1, zmax); break;
+		case '+': level = min(level+10, zmax); break;
+		case '-': level = max(level-1, zmin); break;
+		case '_': level = max(level-10, zmin); break;
+		case 'g': sphere = !sphere; break;
+		case 's': shade = !shade; break;
+		case 27: exit(0); break;
+		default: break;
+	}
+	glutPostRedisplay();
+}
+
+void cbSpecialKeys(int key, int x, int y) {
+	// handle modifier key events
+	switch (key) {
+		case GLUT_KEY_UP: yoff = min(yoff+0.02, 3.0); break;
+		case GLUT_KEY_DOWN: yoff = max(yoff-0.02, -1.0); break;
+		case GLUT_KEY_LEFT: xoff = max(xoff-0.02, -1.0); break;
+		case GLUT_KEY_RIGHT: xoff = min(xoff+0.02, 4.0); break;
+		case GLUT_KEY_PAGE_UP: doZoom(-1); break;
+		case GLUT_KEY_PAGE_DOWN: doZoom(1); break;
+	}
+	glutPostRedisplay();
+}
+
+void cbMouseButtons(int button, int state, int x, int y) {
+	// handle mouse button events
+	downX = x;
+	downY = y;
+	int dlevel;
+	switch (glutGetModifiers()) {
+		case GLUT_ACTIVE_SHIFT: dlevel = 10; break;
+		case GLUT_ACTIVE_CTRL: dlevel = 100; break;
+		default: dlevel = 1;
+	}
+	switch (button) {
+		case GLUT_LEFT_BUTTON:
+			leftButton = state == GLUT_DOWN; 
+			glutWarpPointer(glutGet(GLUT_WINDOW_WIDTH)/2, glutGet(GLUT_WINDOW_HEIGHT)/2);
+			break;
+		case GLUT_MIDDLE_BUTTON: if(state == GLUT_DOWN) sphere = !sphere; break;
+		case GLUT_RIGHT_BUTTON:
+			rightButton = state == GLUT_DOWN;
+			glutWarpPointer(glutGet(GLUT_WINDOW_WIDTH)/2, glutGet(GLUT_WINDOW_HEIGHT)/2);
+			break;
+		case 3: level = min(level + dlevel, zmax); break;
+		case 4: level = max(level - dlevel, zmin); break;
+	}
+	glutPostRedisplay();
+}
+
+void cbMouseMotion(int x, int y) {
+	// handle mouse dragging
+	static bool active = true;
+	if (active) {
+		int dx = x - glutGet(GLUT_WINDOW_WIDTH)/2;
+		int dy = glutGet(GLUT_WINDOW_HEIGHT)/2 - y;
+		if (leftButton) {
+			if (sphere) {
+				phi+= dx/16.0;
+				theta+= dy/16.0;
+			}
+			else {
+				xoff+= dx/1000.0;
+				yoff+= dy/1000.0;
+			}
+		}
+		if (rightButton) doZoom(dy);
+		glutPostRedisplay();
+		active = false;
+		glutWarpPointer(glutGet(GLUT_WINDOW_WIDTH)/2, glutGet(GLUT_WINDOW_HEIGHT)/2);
+	}
+	else active = true;
+}
+
+Vec3 rotXY(Vec3 v, float angle) {
+	Vec3 rv;
+	rv.x = v.x*cos(angle) - v.y*sin(angle);
+	rv.y = v.x*sin(angle) - v.y*cos(angle);
+	rv.z = v.z;
+	return rv;
+}
+
+void cbPollArduino(int v) {
+	float trackballSpeed = -0.0001167;
+	float trackballSpeedZ = 0.0001577;
+	
+	char msg[100];
+	serial.scan(msg, '*');
+	
+	cout << "arduino says " << msg << endl;
+	
+	int values[9];
+	int i = 9;
+	while(strlen(msg)) {
+		int pos=strlen(msg)-1;
+		while(msg[pos]!=',' && pos>0) pos--;
+		values[--i] = atoi(msg+pos);
+		msg[pos] = '\0';
+	}
+	cout << i << endl;
+	if (i==0) {
+		level = min(level+values[1]-values[0], zmax);
+
+/*		int knop = ofToBoolean(values[2]);
+		if (prevKnop==-1) prevKnop = knop;
+		if (knop!=prevKnop) {
+			prevKnop = knop;
+			((Application*)root)->loadNextMap = true;
+		}
+*/
+		Vec3 v0 = Vec3(values[3], values[4], 0);
+		Vec3 v1 = Vec3(values[5], values[6], 0);
+		Vec3 v2 = Vec3(-values[7], values[8], 0);
+		
+		Vec3 dif, vsum;
+		
+		//cout << trackballSpeedZ << endl;
+		
+		if ((v0.x<=0 && v1.x<=0 && v2.x<=0) || (v0.x>=0 && v1.x>=0 && v2.x>=0)) {
+			dif.z = v0.x / trackballSpeedZ;
+		}
+		
+		v1 = rotXY(v1, -TWO_PI/3);
+		v2 = rotXY(v2, TWO_PI/3);
+		
+		v0 /= trackballSpeed;
+		v1 /= trackballSpeed;
+		v2 /= trackballSpeed;
+		
+		vsum = (v0+v1+v2) / 3;
+		
+		dif.x = vsum.x;
+		dif.y = vsum.y;
+		
+		
+//		ball.moveBy(dif);
+void Ball::moveBy(ofxVec3f speed) {
+    ofxVec3f  vDown, vDrag;
+    ofxQuaternion qDown, qDrag;
+
+    this->speed += speed;
+
+    //x,y
+    vDown = mouseToSphere(0, 0);
+    qDown = quaternion;
+    vDrag = mouseToSphere(speed.x, speed.y);
+    qDrag = ofxQuaternion(vDown.dot(vDrag), vDown.crossed(vDrag)); //let op: crossed en niet cross
+    quaternion = qDrag * qDown;
+
+    //z
+    if (speed.z!=0) {
+        vDown = mouseToSphere(sin(0),cos(0));
+        qDown = quaternion;
+        vDrag = mouseToSphere(sin(speed.z),cos(speed.z));
+        qDrag = ofxQuaternion(vDown.dot(vDrag), vDown.crossed(vDrag)); //let op: crossed en niet cross
+        quaternion = qDrag * qDown;
+    }
+}
+	}
+	
+	serial.putch('x');
+	glutPostRedisplay();
+	glutTimerFunc(25, cbPollArduino, 0);
+}
+
+int main(int argc, char** argv) {
+	serial.init("/dev/ttyS0", 9600);
+	
+	// initialize OpenGL
+	glutInit(&argc, argv);
+	glutInitDisplayMode(GLUT_SINGLE | GLUT_RGBA | GLUT_DEPTH);
+	glutInitWindowSize(250, 250);
+	glutInitWindowPosition(100, 100);
+	glutCreateWindow(argv[0]);
+	
+	// setup our model
+	init();
+	
+	glutFullScreen();
+	glutSetCursor(GLUT_CURSOR_NONE);
+	
+	// attach callback routines
+	glutDisplayFunc(cbDisplay);
+	glutReshapeFunc(cbReshape);
+	glutKeyboardFunc(cbKeys);
+	glutSpecialFunc(cbSpecialKeys);
+	glutMouseFunc(cbMouseButtons);
+	glutMotionFunc(cbMouseMotion);
+	glutTimerFunc(1, cbPollArduino, 0);
+	
+	// rock 'n' roll
+	glutMainLoop();
+	return 0; 
+}
